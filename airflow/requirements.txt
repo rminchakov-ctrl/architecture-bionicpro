@@ -1,0 +1,4 @@
+psycopg2-binary
+airflow-clickhouse-plugin
+clickhouse-driver
+clickhouse-cityhash

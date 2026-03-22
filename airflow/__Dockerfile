@@ -1,0 +1,32 @@
+FROM python:3.9-slim-bookworm
+
+# Установка системных зависимостей
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    gcc \
+    g++ \
+    libpq-dev \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Создаем пользователя airflow
+RUN useradd -m -U -s /bin/bash airflow && \
+    mkdir -p /opt/airflow/dags /opt/airflow/logs /opt/airflow/plugins && \
+    chown -R airflow:airflow /opt/airflow
+
+USER airflow
+WORKDIR /opt/airflow
+
+# Копируем и устанавливаем зависимости
+COPY --chown=airflow:airflow requirements.txt .
+RUN pip install --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# Переменные окружения Airflow
+ENV AIRFLOW_HOME=/opt/airflow \
+    AIRFLOW__CORE__LOAD_EXAMPLES=false \
+    AIRFLOW__CORE__EXECUTOR=LocalExecutor
+
+EXPOSE 8080
+
+CMD ["bash"]

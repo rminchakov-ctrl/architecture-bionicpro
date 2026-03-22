@@ -1,0 +1,170 @@
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    AIRFLOW__WEBSERVER__SECRET_KEY: 'your_airflow_webserver_sec_key'
+    AIRFLOW_CONN_CLICKHOUSE_DEFAULT: 'clickhouse://default:@olap_db:9000/bionicpro'
+    # Переменные для подключения к ClickHouse
+    CLICKHOUSE_HOST: olap_db
+    CLICKHOUSE_PORT: 9000
+    CLICKHOUSE_DB: bionicpro
+    CLICKHOUSE_USER: default
+    CLICKHOUSE_PASSWORD: default_pwd
+    _PIP_ADDITIONAL_REQUIREMENTS: ''
+    AIRFLOW_INPUT_DIR: '/opt/airflow/dag-inputs'
+    HOSTNAME: airflow-webserver
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./dags/sql:/opt/airflow/dags/sql
+    - ./requirements.txt:/opt/airflow/requirements.txt
+    - ./data:/opt/airflow/sample_files
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    postgres:
+      condition: service_healthy
+    olap_db:
+      condition: service_healthy
+  networks:
+    - bionicpro-network
+
+services:
+  postgres:
+    image: postgres:16.0
+    volumes:
+      - ./db/init-db.sql:/docker-entrypoint-initdb.d/db.sql
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    logging:
+      options:
+        max-size: 10m
+        max-file: "3"
+    healthcheck:
+      test:
+        - CMD
+        - pg_isready
+        - -U
+        - airflow
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+    networks:
+      - bionicpro-network
+
+  olap_db:
+    image: clickhouse/clickhouse-server:latest
+    environment:
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=default_pwd
+      - CLICKHOUSE_DB=bionicpro
+    ports:
+      - "8123:8123"
+      - "9431:9000"
+    volumes:
+      - ./clickhouse-data:/var/lib/clickhouse
+      - ./olap-db:/docker-entrypoint-initdb.d
+      - ./olap-db:/var/lib/clickhouse/user_files
+      - ./olap-db/users.xml:/etc/clickhouse-server/users.d/users.xml
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --query 'SELECT 1'"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+    networks:
+      - bionicpro-network
+
+  airflow-webserver:
+    <<: *airflow-common
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      olap_db:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    command: webserver
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -f http://localhost:8080/health || exit 1" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      postgres:
+        condition: service_healthy
+      olap_db:
+        condition: service_healthy
+      airflow-webserver:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -f http://localhost:8080/health || exit 1" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  airflow-triggerer:
+    <<: *airflow-common
+    depends_on:
+      postgres:
+        condition: service_healthy
+      olap_db:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    command: bash -c "airflow triggerer"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - airflow jobs check --job-type TriggererJob --hostname "${HOSTNAME}"
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+
+  airflow-cli:
+    <<: *airflow-common
+    depends_on:
+      postgres:
+        condition: service_healthy
+      olap_db:
+        condition: service_healthy
+    profiles:
+      - debug
+    command:
+      - bash
+      - -c
+      - airflow
+
+  airflow-init:
+    <<: *airflow-common
+    depends_on:
+      postgres:
+        condition: service_healthy
+      olap_db:
+        condition: service_healthy
+    command: >
+      bash -c "airflow db init && airflow users create --username admin --firstname admin --lastname admin --role Admin --email admin@sample.ru --password admin"
+
+networks:
+  bionicpro-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
