@@ -303,9 +303,21 @@ services:
     command: >
       bash -c "airflow db init && airflow users create --username admin --firstname admin --lastname admin --role Admin --email admin@sample.ru --password admin"
 
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+      - nginx_cache:/var/cache/nginx
+    depends_on:
+      - minio
+    networks:
+      - bionicpro-network
 
 volumes:
   minio_storage: {}
+  nginx_cache: {}
 
 networks:
   bionicpro-network:

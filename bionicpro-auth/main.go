@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"log"
@@ -23,10 +24,10 @@ var (
 
 func main() {
 	cfg := config.LoadConfig()
+	ctx := context.Background()
 
 	// Инициализация хранилища сессий
-	var err error
-	sessionStorage, err = auth.NewSessionStorage()
+	sessionStorage, err := auth.NewSessionStorage()
 	if err != nil {
 		log.Fatal("Failed to initialize session storage:", err)
 	}
@@ -87,7 +88,10 @@ func main() {
 	engine.GET("/auth/callback", authHandler.Callback)
 	engine.GET("/logout", authHandler.Logout)
 
-	reportHandler := handlers.NewReportHandler(clickhouseDB)
+	reportHandler, err := handlers.NewReportHandler(ctx, clickhouseDB)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	// Защищенные routes
 	protected := engine.Group("/")
