@@ -140,6 +140,7 @@ services:
     volumes:
         - ./crm-db:/docker-entrypoint-initdb.d
         - ./postgres-crm-data:/var/lib/postgresql/data
+        - ./crm-db/init-replication.sql:/docker-entrypoint-initdb.d/10-replication.sql  # добавляем скрипт репликации
     ports:
       - "5444:5432"
     networks:
@@ -148,8 +149,8 @@ services:
   olap_db:
     image: clickhouse/clickhouse-server:latest
     environment:
-      #- CLICKHOUSE_USER=default
-      #- CLICKHOUSE_PASSWORD=default_pwd
+      # - CLICKHOUSE_USER=default
+      # - CLICKHOUSE_PASSWORD=default_pwd
       - CLICKHOUSE_DB=bionicpro
       - HOSTNAME=olap_db
     ports:
@@ -160,6 +161,7 @@ services:
       - ./olap-db:/docker-entrypoint-initdb.d
       - ./olap-db:/var/lib/clickhouse/user_files
       - ./olap-db/users.xml:/etc/clickhouse-server/users.d/users.xml
+      - ./clickhouse/init-cdc.sql:/docker-entrypoint-initdb.d/10-cdc-init.sql  # Добавляем CDC инициализацию
     healthcheck:
       test: ["CMD-SHELL", "clickhouse-client --user default --password default_pwd --query 'SELECT 1' || exit 1"]
       interval: 5s
@@ -312,6 +314,46 @@ services:
       - nginx_cache:/var/cache/nginx
     depends_on:
       - minio
+    networks:
+      - bionicpro-network
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:latest
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - bionicpro-network
+
+  kafka:
+    image: confluentinc/cp-kafka:latest
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    networks:
+      - bionicpro-network
+
+  debezium:
+    image: debezium/connect:2.3.0.Final
+    depends_on:
+      - kafka
+      - crm_db
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: crm-connect-cluster
+      CONFIG_STORAGE_TOPIC: crm-connect-configs
+      OFFSET_STORAGE_TOPIC: crm-connect-offsets
+      STATUS_STORAGE_TOPIC: crm-connect-statuses
+      CONNECT_CONFIG_PROVIDERS: "file"
+      CONNECT_CONFIG_PROVIDERS_FILE_PATH: "/kafka/connect"
+    ports:
+      - "8083:8083"
+    volumes:
+      - ./connectors:/kafka/connect
     networks:
       - bionicpro-network
 

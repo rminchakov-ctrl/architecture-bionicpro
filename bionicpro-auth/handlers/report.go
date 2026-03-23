@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -24,6 +25,7 @@ type ReportHandler struct {
 	cdnBaseURL   string
 }
 
+// NewReportHandler ...
 func NewReportHandler(ctx context.Context, db *sql.DB) (*ReportHandler, error) {
 	// Инициализация MinIO клиента
 	minioClient, err := minio.New("minio:9000", &minio.Options{
@@ -57,42 +59,11 @@ func NewReportHandler(ctx context.Context, db *sql.DB) (*ReportHandler, error) {
 	return handler, nil
 }
 
-// generateReportKey генерирует ключ для хранения отчета в S3
-func (h *ReportHandler) generateReportKey(userID, reportType, dateRange string) string {
-	return fmt.Sprintf("user_%s/%s/%s_%s.json",
-		userID, reportType, dateRange, time.Now().Format("2006-01-02"))
-}
-
-// getCachedReport пытается получить отчет из S3
-func (h *ReportHandler) getCachedReport(ctx context.Context, objectKey string) ([]byte, bool) {
-	object, err := h.minioClient.GetObject(ctx, h.bucketName, objectKey, minio.GetObjectOptions{})
-	if err != nil {
-		return nil, false
-	}
-	defer object.Close()
-
-	data, err := io.ReadAll(object)
-	if err != nil {
-		return nil, false
-	}
-
-	return data, true
-}
-
-// cacheReport сохраняет отчет в S3
-func (h *ReportHandler) cacheReport(ctx context.Context, objectKey string, reportData []byte) error {
-	_, err := h.minioClient.PutObject(ctx, h.bucketName, objectKey,
-		bytes.NewReader(reportData), int64(len(reportData)), minio.PutObjectOptions{
-			ContentType: "application/json",
-		})
-	return err
-}
-
-// GetUserReport возвращает отчеты по конкретному пользователю с кэшированием
-func (h *ReportHandler) GetUserReport(c *gin.Context) {
+// GetEMGReport возвращает отчет по данным EMG-сенсоров
+func (h *ReportHandler) GetEMGReport(c *gin.Context) {
 	userID := c.Param("user_id")
-	reportType := "user"
-	dateRange := c.DefaultQuery("date_range", "all")
+	reportType := "emg"
+	dateRange := c.DefaultQuery("date_range", "7days") // по умолчанию за 7 дней
 
 	// Проверка авторизации
 	session, exists := c.Get("session")
@@ -117,59 +88,50 @@ func (h *ReportHandler) GetUserReport(c *gin.Context) {
 	// Если нет в кэше, генерируем новый отчет
 	query := `
         SELECT 
-            user_id, prosthesis_id, report_date,
-            user_name, user_email, prosthesis_model,
-            total_usage_time, avg_daily_usage, max_force_application,
-            avg_battery_health, total_steps_count, emergency_shutdowns,
-            usage_intensity, maintenance_needed
-        FROM prosthesis_reports_mart 
+            user_id, prosthesis_type, muscle_group,
+            signal_frequency, signal_duration, signal_amplitude,
+            signal_time
+        FROM emg_sensor_data 
         WHERE user_id = ?
-        ORDER BY report_date DESC
-        LIMIT 100
+        ORDER BY signal_time DESC
+        LIMIT 1000
     `
 
-	rows, err := h.clickhouseDB.Query(query, userID)
+	rows, err := h.clickhouseDB.QueryContext(ctx, query, userID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
-			"error":   "Failed to fetch user reports",
+			"error":   "Failed to fetch EMG data",
 			"details": err.Error(),
 		})
 		return
 	}
 	defer rows.Close()
 
-	var reports []models.ProsthesisReport
+	var emgData []models.EMGData
 	for rows.Next() {
-		var report models.ProsthesisReport
+		var data models.EMGData
 		err := rows.Scan(
-			&report.UserID,
-			&report.ProsthesisID,
-			&report.ReportDate,
-			&report.UserName,
-			&report.UserEmail,
-			&report.ProsthesisModel,
-			&report.TotalUsageTime,
-			&report.AvgDailyUsage,
-			&report.MaxForceApplication,
-			&report.AvgBatteryHealth,
-			&report.TotalStepsCount,
-			&report.EmergencyShutdowns,
-			&report.UsageIntensity,
-			&report.MaintenanceNeeded,
+			&data.UserID,
+			&data.ProsthesisType,
+			&data.MuscleGroup,
+			&data.SignalFrequency,
+			&data.SignalDuration,
+			&data.SignalAmplitude,
+			&data.SignalTime,
 		)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{
-				"error":   "Failed to scan report",
+				"error":   "Failed to scan EMG data",
 				"details": err.Error(),
 			})
 			return
 		}
-		reports = append(reports, report)
+		emgData = append(emgData, data)
 	}
 
 	if err = rows.Err(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
-			"error":   "Error iterating reports",
+			"error":   "Error iterating EMG data",
 			"details": err.Error(),
 		})
 		return
@@ -178,9 +140,10 @@ func (h *ReportHandler) GetUserReport(c *gin.Context) {
 	// Формируем ответ
 	response := gin.H{
 		"user_id":      userID,
-		"reports":      reports,
+		"report_type":  reportType,
+		"data":         emgData,
+		"count":        len(emgData),
 		"generated_at": time.Now(),
-		"cache_status": "miss",
 		"report_url":   fmt.Sprintf("%s/%s/%s", h.cdnBaseURL, h.bucketName, objectKey),
 	}
 
@@ -197,44 +160,28 @@ func (h *ReportHandler) GetUserReport(c *gin.Context) {
 	// Сохраняем в S3 (асинхронно)
 	go func() {
 		if err := h.cacheReport(context.Background(), objectKey, responseData); err != nil {
-			fmt.Printf("Failed to cache report: %v\n", err)
+			log.Printf("Failed to cache EMG report: %v\n", err)
 		}
 	}()
 
 	c.Data(http.StatusOK, "application/json", responseData)
 }
 
-// GetProsthesisReport возвращает отчет по конкретному протезу с кэшированием
-func (h *ReportHandler) GetProsthesisReport(c *gin.Context) {
-	prosthesisID := c.Param("prosthesis_id")
-	reportType := "prosthesis"
+// GetCustomerReport возвращает отчет по данным клиентов
+func (h *ReportHandler) GetCustomerReport(c *gin.Context) {
+	userID := c.Param("user_id")
+	reportType := "customer"
 	dateRange := c.DefaultQuery("date_range", "all")
 
+	// Проверка авторизации
 	session, exists := c.Get("session")
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Session not found"})
 		return
 	}
 	authSession := session.(*models.Session)
-
-	// Проверка доступа
-	var userID string
-	err := h.clickhouseDB.QueryRow(`
-        SELECT user_id FROM prosthesis_reports_mart 
-        WHERE prosthesis_id = ? AND user_id = ?
-        LIMIT 1
-    `, prosthesisID, authSession.UserID).Scan(&userID)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			c.JSON(http.StatusForbidden, gin.H{
-				"error": "Access denied or prosthesis not found",
-			})
-		} else {
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"error":   "Database error",
-				"details": err.Error(),
-			})
-		}
+	if authSession.UserID != userID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied to other user reports"})
 		return
 	}
 
@@ -246,67 +193,53 @@ func (h *ReportHandler) GetProsthesisReport(c *gin.Context) {
 		return
 	}
 
-	// Генерируем отчет
+	// Запрос к витрине customer_reporting_mart
 	query := `
         SELECT 
-            user_id, prosthesis_id, report_date,
-            user_name, user_email, prosthesis_model,
-            total_usage_time, avg_daily_usage, max_force_application,
-            avg_battery_health, total_steps_count, emergency_shutdowns,
-            usage_intensity, maintenance_needed
-        FROM prosthesis_reports_mart 
-        WHERE prosthesis_id = ?
-        ORDER BY report_date DESC
-        LIMIT 30
+            customer_id, customer_name, customer_email,
+            age_group, gender, country,
+            data_completeness, created_date
+        FROM customer_reporting_mart 
+        WHERE customer_id = ?
+        LIMIT 1
     `
 
-	rows, err := h.clickhouseDB.Query(query, prosthesisID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error":   "Failed to fetch prosthesis reports",
-			"details": err.Error(),
-		})
-		return
-	}
-	defer rows.Close()
+	var customerData models.CustomerData
+	err := h.clickhouseDB.QueryRowContext(ctx, query, userID).Scan(
+		&customerData.CustomerID,
+		&customerData.CustomerName,
+		&customerData.CustomerEmail,
+		&customerData.AgeGroup,
+		&customerData.Gender,
+		&customerData.Country,
+		&customerData.DataCompleteness,
+		&customerData.CreatedDate,
+	)
 
-	var reports []models.ProsthesisReport
-	for rows.Next() {
-		var report models.ProsthesisReport
-		err := rows.Scan(
-			&report.UserID,
-			&report.ProsthesisID,
-			&report.ReportDate,
-			&report.UserName,
-			&report.UserEmail,
-			&report.ProsthesisModel,
-			&report.TotalUsageTime,
-			&report.AvgDailyUsage,
-			&report.MaxForceApplication,
-			&report.AvgBatteryHealth,
-			&report.TotalStepsCount,
-			&report.EmergencyShutdowns,
-			&report.UsageIntensity,
-			&report.MaintenanceNeeded,
-		)
-		if err != nil {
+	if err != nil {
+		if err == sql.ErrNoRows {
+			c.JSON(http.StatusNotFound, gin.H{
+				"error": "Customer data not found",
+			})
+		} else {
 			c.JSON(http.StatusInternalServerError, gin.H{
-				"error":   "Failed to scan report",
+				"error":   "Failed to fetch customer data",
 				"details": err.Error(),
 			})
-			return
 		}
-		reports = append(reports, report)
+		return
 	}
 
+	// Формируем ответ
 	response := gin.H{
-		"prosthesis_id": prosthesisID,
-		"reports":       reports,
-		"generated_at":  time.Now(),
-		"cache_status":  "miss",
-		"report_url":    fmt.Sprintf("%s/%s/%s", h.cdnBaseURL, h.bucketName, objectKey),
+		"user_id":      userID,
+		"report_type":  reportType,
+		"customer":     customerData,
+		"generated_at": time.Now(),
+		"report_url":   fmt.Sprintf("%s/%s/%s", h.cdnBaseURL, h.bucketName, objectKey),
 	}
 
+	// Сериализуем и кэшируем
 	responseData, err := json.Marshal(response)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -316,93 +249,125 @@ func (h *ReportHandler) GetProsthesisReport(c *gin.Context) {
 		return
 	}
 
+	// Сохраняем в S3 (асинхронно)
 	go func() {
 		if err := h.cacheReport(context.Background(), objectKey, responseData); err != nil {
-			fmt.Printf("Failed to cache prosthesis report: %v\n", err)
+			log.Printf("Failed to cache customer report: %v\n", err)
 		}
 	}()
 
 	c.Data(http.StatusOK, "application/json", responseData)
 }
 
-// GetReportSummary возвращает сводку с кэшированием
-func (h *ReportHandler) GetReportSummary(c *gin.Context) {
+// GetSummaryReport возвращает сводный отчет
+func (h *ReportHandler) GetSummaryReport(c *gin.Context) {
+	userID := c.Param("user_id")
+	reportType := "summary"
+	dateRange := c.DefaultQuery("date_range", "current")
+
+	// Проверка авторизации
 	session, exists := c.Get("session")
 	if !exists {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Session not found"})
 		return
 	}
 	authSession := session.(*models.Session)
-	reportType := "summary"
-	dateRange := "current"
+	if authSession.UserID != userID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied to other user reports"})
+		return
+	}
 
 	ctx := c.Request.Context()
 	// Проверяем кэш
-	objectKey := h.generateReportKey(authSession.UserID, reportType, dateRange)
+	objectKey := h.generateReportKey(userID, reportType, dateRange)
 	if cachedData, found := h.getCachedReport(ctx, objectKey); found {
 		c.Data(http.StatusOK, "application/json", cachedData)
 		return
 	}
 
-	query := `
+	// Сводные данные по EMG
+	emgSummaryQuery := `
         SELECT 
-            prosthesis_id,
-            MAX(report_date) as last_report_date,
-            AVG(total_usage_time) as avg_usage_time,
-            MAX(emergency_shutdowns) as total_emergencies,
-            MAX(maintenance_needed) as needs_maintenance
-        FROM prosthesis_reports_mart 
+            COUNT() as total_records,
+            AVG(signal_amplitude) as avg_amplitude,
+            MAX(signal_amplitude) as max_amplitude,
+            MIN(signal_amplitude) as min_amplitude,
+            MAX(signal_time) as last_record
+        FROM emg_sensor_data 
         WHERE user_id = ?
-        GROUP BY prosthesis_id
-        ORDER BY last_report_date DESC
     `
 
-	rows, err := h.clickhouseDB.Query(query, authSession.UserID)
+	var emgSummary struct {
+		TotalRecords uint64    `json:"total_records"`
+		AvgAmplitude float64   `json:"avg_amplitude"`
+		MaxAmplitude float64   `json:"max_amplitude"`
+		MinAmplitude float64   `json:"min_amplitude"`
+		LastRecord   time.Time `json:"last_record"`
+	}
+
+	err := h.clickhouseDB.QueryRowContext(ctx, emgSummaryQuery, userID).Scan(
+		&emgSummary.TotalRecords,
+		&emgSummary.AvgAmplitude,
+		&emgSummary.MaxAmplitude,
+		&emgSummary.MinAmplitude,
+		&emgSummary.LastRecord,
+	)
+
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
-			"error":   "Failed to fetch report summary",
+			"error":   "Failed to fetch EMG summary",
 			"details": err.Error(),
 		})
 		return
 	}
-	defer rows.Close()
 
-	type SummaryItem struct {
-		ProsthesisID     string    `json:"prosthesis_id"`
-		LastReportDate   time.Time `json:"last_report_date"`
-		AvgUsageTime     float64   `json:"avg_usage_time"`
-		TotalEmergencies int       `json:"total_emergencies"`
-		NeedsMaintenance bool      `json:"needs_maintenance"`
+	// Данные клиента
+	customerQuery := `
+        SELECT 
+            customer_name, customer_email, age_group,
+            gender, country, data_completeness
+        FROM customer_reporting_mart 
+        WHERE customer_id = ?
+        LIMIT 1
+    `
+
+	var customer struct {
+		Name             string  `json:"name"`
+		Email            string  `json:"email"`
+		AgeGroup         string  `json:"age_group"`
+		Gender           string  `json:"gender"`
+		Country          string  `json:"country"`
+		DataCompleteness float32 `json:"data_completeness"`
 	}
 
-	var summary []SummaryItem
-	for rows.Next() {
-		var item SummaryItem
-		err := rows.Scan(
-			&item.ProsthesisID,
-			&item.LastReportDate,
-			&item.AvgUsageTime,
-			&item.TotalEmergencies,
-			&item.NeedsMaintenance,
-		)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"error":   "Failed to scan summary item",
-				"details": err.Error(),
-			})
-			return
-		}
-		summary = append(summary, item)
+	err = h.clickhouseDB.QueryRowContext(ctx, customerQuery, userID).Scan(
+		&customer.Name,
+		&customer.Email,
+		&customer.AgeGroup,
+		&customer.Gender,
+		&customer.Country,
+		&customer.DataCompleteness,
+	)
+
+	if err != nil && err != sql.ErrNoRows {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "Failed to fetch customer data",
+			"details": err.Error(),
+		})
+		return
 	}
 
+	// Формируем ответ
 	response := gin.H{
-		"user_id":      authSession.UserID,
-		"summary":      summary,
+		"user_id":      userID,
+		"report_type":  reportType,
+		"emg_summary":  emgSummary,
+		"customer":     customer,
 		"generated_at": time.Now(),
-		"cache_status": "miss",
 		"report_url":   fmt.Sprintf("%s/%s/%s", h.cdnBaseURL, h.bucketName, objectKey),
 	}
 
+	// Сериализуем и кэшируем
 	responseData, err := json.Marshal(response)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -412,9 +377,10 @@ func (h *ReportHandler) GetReportSummary(c *gin.Context) {
 		return
 	}
 
+	// Сохраняем в S3 (асинхронно)
 	go func() {
 		if err := h.cacheReport(context.Background(), objectKey, responseData); err != nil {
-			fmt.Printf("Failed to cache summary report: %v\n", err)
+			log.Printf("Failed to cache summary report: %v\n", err)
 		}
 	}()
 
@@ -474,4 +440,35 @@ func (h *ReportHandler) InvalidateCache(c *gin.Context) {
 		"user_id":     userID,
 		"report_type": reportType,
 	})
+}
+
+// generateReportKey генерирует ключ для хранения отчета в S3
+func (h *ReportHandler) generateReportKey(userID, reportType, dateRange string) string {
+	return fmt.Sprintf("user_%s/%s/%s_%s.json",
+		userID, reportType, dateRange, time.Now().Format("2006-01-02"))
+}
+
+// getCachedReport пытается получить отчет из S3
+func (h *ReportHandler) getCachedReport(ctx context.Context, objectKey string) ([]byte, bool) {
+	object, err := h.minioClient.GetObject(ctx, h.bucketName, objectKey, minio.GetObjectOptions{})
+	if err != nil {
+		return nil, false
+	}
+	defer object.Close()
+
+	data, err := io.ReadAll(object)
+	if err != nil {
+		return nil, false
+	}
+
+	return data, true
+}
+
+// cacheReport сохраняет отчет в S3
+func (h *ReportHandler) cacheReport(ctx context.Context, objectKey string, reportData []byte) error {
+	_, err := h.minioClient.PutObject(ctx, h.bucketName, objectKey,
+		bytes.NewReader(reportData), int64(len(reportData)), minio.PutObjectOptions{
+			ContentType: "application/json",
+		})
+	return err
 }

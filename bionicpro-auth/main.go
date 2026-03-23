@@ -3,14 +3,11 @@ package main
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"log"
-	"net/http"
 
 	"bionicpro-auth/auth"
 	"bionicpro-auth/config"
 	"bionicpro-auth/handlers"
-	"bionicpro-auth/models"
 
 	"github.com/gin-gonic/gin"
 	"golang.org/x/oauth2"
@@ -97,73 +94,16 @@ func main() {
 	protected := engine.Group("/")
 	protected.Use(authHandler.AuthMiddleware())
 	{
-		protected.GET("/api/user", getUserInfo)
-		protected.GET("/api/reports", getReports)
-		protected.GET("/api/prosthesis-data", getProsthesisData)
-
-		protected.GET("/api/reports/user/:user_id", reportHandler.GetUserReport)
-		protected.GET("/api/reports/prosthesis/:prosthesis_id", reportHandler.GetProsthesisReport)
+		protected.GET("/api/reports/emg/:user_id", reportHandler.GetEMGReport)
+		protected.GET("/api/reports/customer/:user_id", reportHandler.GetCustomerReport)
+		protected.GET("/api/reports/summary/:user_id", reportHandler.GetSummaryReport)
 	}
 
 	// Health check
 	engine.GET("/health", func(c *gin.Context) {
-		c.JSON(200, gin.H{"status": "OK"})
+		engine.GET("/health", reportHandler.GetHealthCheck)
 	})
 
 	log.Printf("Server starting on %s", cfg.ServerAddress)
 	log.Fatal(engine.Run(cfg.ServerAddress))
-}
-
-// Обработчик для получения информации о пользователе
-func getUserInfo(c *gin.Context) {
-	session := c.MustGet("session").(*models.Session)
-
-	c.JSON(200, gin.H{
-		"user_id": session.UserID,
-		"message": "Authenticated successfully",
-	})
-}
-
-// Обработчик для получения отчетов (прокси к report-service)
-func getReports(c *gin.Context) {
-	session := c.MustGet("session").(*models.Session)
-
-	client := &http.Client{}
-	req, _ := http.NewRequest("GET", "http://report-service:8082/api/reports", nil)
-	req.Header.Add("Authorization", "Bearer "+session.AccessToken)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		c.JSON(502, gin.H{"error": "Failed to connect to report service"})
-		return
-	}
-	defer resp.Body.Close()
-
-	// Проксируем ответ от сервиса отчетов
-	var reportData any
-	json.NewDecoder(resp.Body).Decode(&reportData)
-
-	c.JSON(resp.StatusCode, reportData)
-}
-
-// Обработчик для данных протезов (прокси к prosthesis-service)
-func getProsthesisData(c *gin.Context) {
-	session := c.MustGet("session").(*models.Session)
-	prosthesisID := c.Query("prosthesis_id")
-
-	client := &http.Client{}
-	req, _ := http.NewRequest("GET", "http://prosthesis-service:8083/api/data?prosthesis_id="+prosthesisID, nil)
-	req.Header.Add("Authorization", "Bearer "+session.AccessToken)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		c.JSON(502, gin.H{"error": "Failed to connect to prosthesis service"})
-		return
-	}
-	defer resp.Body.Close()
-
-	var prosthesisData any
-	json.NewDecoder(resp.Body).Decode(&prosthesisData)
-
-	c.JSON(resp.StatusCode, prosthesisData)
 }

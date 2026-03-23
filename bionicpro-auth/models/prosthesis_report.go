@@ -2,19 +2,25 @@ package models
 
 import "time"
 
-type ProsthesisReport struct {
-	UserID              string    `json:"user_id" db:"user_id"`
-	ProsthesisID        string    `json:"prosthesis_id" db:"prosthesis_id"`
-	ReportDate          time.Time `json:"report_date" db:"report_date"`
-	UserName            string    `json:"user_name" db:"user_name"`
-	UserEmail           string    `json:"user_email" db:"user_email"`
-	ProsthesisModel     string    `json:"prosthesis_model" db:"prosthesis_model"`
-	TotalUsageTime      int       `json:"total_usage_time" db:"total_usage_time"`
-	AvgDailyUsage       int       `json:"avg_daily_usage" db:"avg_daily_usage"`
-	MaxForceApplication float32   `json:"max_force_application" db:"max_force_application"`
-	AvgBatteryHealth    float32   `json:"avg_battery_health" db:"avg_battery_health"`
-	TotalStepsCount     int       `json:"total_steps_count" db:"total_steps_count"`
-	EmergencyShutdowns  int       `json:"emergency_shutdowns" db:"emergency_shutdowns"`
-	UsageIntensity      string    `json:"usage_intensity" db:"usage_intensity"`
-	MaintenanceNeeded   bool      `json:"maintenance_needed" db:"maintenance_needed"`
+// EMGData представляет запись данных EMG-датчика
+type EMGData struct {
+	UserID          uint32    `json:"user_id"`
+	ProsthesisType  string    `json:"prosthesis_type"`
+	MuscleGroup     string    `json:"muscle_group"`
+	SignalFrequency uint32    `json:"signal_frequency"`
+	SignalDuration  uint32    `json:"signal_duration"`
+	SignalAmplitude float64   `json:"signal_amplitude"` // Исправляем на float64 для JSON
+	SignalTime      time.Time `json:"signal_time"`
+}
+
+// CustomerData представляет данные клиента из витрины
+type CustomerData struct {
+	CustomerID       uint64    `json:"customer_id"`
+	CustomerName     string    `json:"customer_name"`
+	CustomerEmail    string    `json:"customer_email"`
+	AgeGroup         string    `json:"age_group"`
+	Gender           string    `json:"gender"`
+	Country          string    `json:"country"`
+	DataCompleteness float32   `json:"data_completeness"`
+	CreatedDate      time.Time `json:"created_date"`
 }

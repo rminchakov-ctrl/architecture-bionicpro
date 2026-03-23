@@ -1,0 +1,53 @@
+@startuml CDC
+
+title Полный поток данных: CDC из PostgreSQL в ClickHouse
+
+together {
+  rectangle "1. PostgreSQL CRM" as pg <<Источник>>
+  note right: WAL логическая репликация
+}
+
+together {
+  rectangle "2. Debezium Connector" as debezium <<CDC>>
+  note right: Публикация debezium_publication\nСлот debezium_slot
+}
+
+together {
+  rectangle "3. Kafka Topic" as kafka <<Очередь>>
+  note right: Топик: crm-db-server.public.customers
+}
+
+together {
+  rectangle "4. KafkaEngine" as kafka_engine <<Консьюмер>>
+  note right: Формат: JSONEachRow\nГруппа: clickhouse-consumer-group
+}
+
+together {
+  database "5. Raw данные" as raw_data <<ClickHouse>>
+  note right: Движок: ReplacingMergeTree\nВерсионность для дедубликации
+}
+
+together {
+  database "6. Витрина отчетности" as reporting_mart <<ClickHouse>>
+  note right: Pre-aggregated data\nИндексы для отчетов
+}
+
+together {
+  rectangle "7. API Сервис" as api <<Потребитель>>
+  note right: JSON API отчеты
+}
+
+together {
+  rectangle "8. Аналитика" as analytics <<Потребитель>>
+  note right: SQL запросы\nВизуализации
+}
+
+pg --> debezium
+debezium --> kafka
+kafka --> kafka_engine
+kafka_engine --> raw_data
+raw_data --> reporting_mart
+reporting_mart --> api
+reporting_mart --> analytics
+
+@enduml
