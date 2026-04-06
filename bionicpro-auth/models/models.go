@@ -4,10 +4,10 @@ import (
 	"time"
 )
 
+// Session - хранится в Redis/Memory (персистентно)
 type Session struct {
 	ID           string    `json:"id"`
-	AccessToken  string    `json:"access_token"`
-	RefreshToken string    `json:"refresh_token"`
+	RefreshToken []byte    `json:"refresh_token"` // зашифрован
 	ExpiresAt    time.Time `json:"expires_at"`
 	UserID       string    `json:"user_id"`
 }

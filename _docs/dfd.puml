@@ -1,0 +1,72 @@
+@startuml BionicPRO_Vertical_Flow
+top to bottom direction
+
+title BionicPRO - Vertical Data Flow
+
+together {
+    node "Внешние источники" as sources {
+        rectangle "Клиентские данные\n(CRM)" as source_clients
+        rectangle "Телеметрия\n(EMG Sensors)" as source_telemetry
+    }
+    note right of source_clients
+    Файл: crm-db/crm.csv
+    end note
+}
+
+together {
+    node "Слой хранения (Первичный)" as storage_primary {
+        database "PostgreSQL\ncrm_db" as db_customers
+        database "PostgreSQL\nsensor_db" as db_sensors    
+    }
+    note right of db_sensors
+        База виртуальная (отсутствует):
+        Файл: olap-db/olap.csv
+    end note
+}
+
+node "Шина данных" as bus {
+    queue "Kafka Topic\ncustomers_cdc" as kafka_topic
+}
+
+node "ClickHouse" as olap {
+    storage "kafka_customers\n(Engine: Kafka)" as ch_kafka
+    storage "customers_cdc_mv\n(Materialized View)" as ch_cdc_mv
+    storage "customers_cdc\n(ReplacingMergeTree)" as ch_cdc
+    storage "customer_reporting_mv\n(Materialized View)" as ch_mart_mv
+    storage "customer_reporting_mart\n(Report Table)" as ch_mart
+    storage "customers_dict\n(Dictionary)"  as ch_dict
+    storage "emg_sensor_data\n(Table)" as ch_emg
+    storage "user_reports_summary_mv\n(Materialized View)" as ch_summary_mv
+    storage "user_reports_summary\n(ReplacingMergeTree)" as ch_summary
+}
+
+node "Backend / API Layer" as api {
+    control "/reports endpoint" as api_handler
+    database "redis\n(Sessions)" as redis
+}
+
+actor "Пользователь" as user
+
+' Потоки данных (Вертикальные связи)
+source_clients --> db_customers : load
+source_telemetry --> db_sensors : load
+db_sensors --> ch_emg : load
+
+db_customers --> kafka_topic : Debezium CDC
+kafka_topic --> ch_kafka : consume
+
+ch_kafka --> ch_cdc_mv: MV Transform
+ch_cdc_mv --> ch_cdc: MV
+ch_kafka --> ch_mart_mv: MV Transform + Aggregation
+ch_mart_mv --> ch_mart: MV
+ch_mart --> ch_dict: Select
+ch_emg --> ch_summary_mv: Aggregation
+ch_summary_mv --> ch_summary: MV
+ch_dict --> ch_summary: Enrich
+
+ch_summary --> api_handler : SQL Select
+api_handler <-> redis : Auth check
+api_handler --> user : JSON Response
+user -> api_handler : Request
+
+@enduml

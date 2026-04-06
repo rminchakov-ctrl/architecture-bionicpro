@@ -5,9 +5,11 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"net/http"
 
 	"bionicpro-auth/config"
+	"bionicpro-auth/internal/session"
 	"bionicpro-auth/models"
 
 	"github.com/gin-gonic/gin"
@@ -15,16 +17,21 @@ import (
 	"golang.org/x/oauth2"
 )
 
-const maxAge = 3600 // 1 час
+const (
+	maxAgeSeconds = 3600
+)
 
+// AuthHandler ...
 type AuthHandler struct {
 	config         *config.Config
 	Oauth2Config   *oauth2.Config
-	sessionStorage *SessionStorage
+	sessionStorage session.Store
+	tokenStorage   *session.InMemoryTokenStore
 	secureCookie   *securecookie.SecureCookie
 }
 
-func NewAuthHandler(cfg *config.Config, storage *SessionStorage, oauth2Config *oauth2.Config) *AuthHandler {
+// NewAuthHandler ...
+func NewAuthHandler(cfg *config.Config, storage session.Store, tokenStorage *session.InMemoryTokenStore, oauth2Config *oauth2.Config) *AuthHandler {
 	secureCookie := securecookie.New(
 		[]byte(cfg.SessionSecret),
 		nil,
@@ -32,12 +39,14 @@ func NewAuthHandler(cfg *config.Config, storage *SessionStorage, oauth2Config *o
 
 	return &AuthHandler{
 		config:         cfg,
-		Oauth2Config:   oauth2Config, // Правильный тип
+		Oauth2Config:   oauth2Config,
 		sessionStorage: storage,
+		tokenStorage:   tokenStorage,
 		secureCookie:   secureCookie,
 	}
 }
 
+// Login ...
 func (h *AuthHandler) Login(c *gin.Context) {
 	// Создаем стейт и PKCE код
 	state := generateRandomString(32)
@@ -52,11 +61,15 @@ func (h *AuthHandler) Login(c *gin.Context) {
 		c.SetCookie("oauth_state", encoded, 300, "/", "", true, true)
 	}
 
-	// Редирект в Keycloak
-	url := h.Oauth2Config.AuthCodeURL(state, oauth2.SetAuthURLParam("code_challenge", generateCodeChallenge(codeVerifier)))
+	// Редирект в Keycloak с PKCE (S256)
+	url := h.Oauth2Config.AuthCodeURL(state,
+		oauth2.SetAuthURLParam("code_challenge", generateCodeChallenge(codeVerifier)),
+		oauth2.SetAuthURLParam("code_challenge_method", "S256"),
+	)
 	c.Redirect(http.StatusFound, url)
 }
 
+// Callback ...
 func (h *AuthHandler) Callback(c *gin.Context) {
 	state := c.Query("state")
 	code := c.Query("code")
@@ -77,15 +90,27 @@ func (h *AuthHandler) Callback(c *gin.Context) {
 				return
 			}
 
+			// Получаем user info для получения UserID
+			userInfo, _ := h.GetUserInfo(token.AccessToken)
+
 			sessionID := generateRandomString(32)
-			session := &models.Session{
-				ID:           sessionID,
-				AccessToken:  token.AccessToken,
-				RefreshToken: token.RefreshToken,
-				ExpiresAt:    token.Expiry,
+			userID := ""
+			if userInfo != nil {
+				userID = userInfo.Sub
 			}
 
-			if err := h.sessionStorage.SaveSession(session); err != nil {
+			// Сохраняем access_token в in-memory хранилище
+			h.tokenStorage.Set(sessionID, token.AccessToken, token.Expiry)
+
+			// В персистентном хранилище (Redis/Memory) сохраняем ТОЛЬКО refresh_token
+			session := &models.Session{
+				ID:           sessionID,
+				RefreshToken: []byte(token.RefreshToken),
+				ExpiresAt:    token.Expiry,
+				UserID:       userID,
+			}
+
+			if err := h.sessionStorage.Save(session); err != nil {
 				c.AbortWithStatus(http.StatusInternalServerError)
 				return
 			}
@@ -94,29 +119,68 @@ func (h *AuthHandler) Callback(c *gin.Context) {
 				c.SetCookie("session_id", encoded, 3600, "/", "", true, true)
 			}
 
-			c.Redirect(http.StatusFound, "/")
+			// Редирект на фронтенд
+			c.Redirect(http.StatusFound, "http://localhost:3000")
 		}
 	}
 	c.AbortWithStatus(http.StatusBadRequest)
 }
 
-func (h *AuthHandler) RefreshToken(session *models.Session) (*models.Session, error) {
-	token := &oauth2.Token{
-		AccessToken:  session.AccessToken,
-		RefreshToken: session.RefreshToken,
-		Expiry:       session.ExpiresAt,
-	}
-
-	newToken, err := h.Oauth2Config.TokenSource(context.Background(), token).Token()
+// GetUserInfo ...
+func (h *AuthHandler) GetUserInfo(accessToken string) (*models.UserInfo, error) {
+	// Запрос к Keycloak userinfo endpoint
+	req, err := http.NewRequest("GET", h.Oauth2Config.Endpoint.TokenURL+"/../userinfo", nil)
 	if err != nil {
 		return nil, err
 	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
 
-	session.AccessToken = newToken.AccessToken
-	session.RefreshToken = newToken.RefreshToken
-	session.ExpiresAt = newToken.Expiry
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
 
-	return session, h.sessionStorage.SaveSession(session)
+	var userInfo models.UserInfo
+	if err := json.NewDecoder(resp.Body).Decode(&userInfo); err != nil {
+		return nil, err
+	}
+
+	return &userInfo, nil
+}
+
+// Logout ...
+func (h *AuthHandler) Logout(c *gin.Context) {
+	if cookie, err := c.Cookie("session_id"); err == nil {
+		var sessionID string
+		if h.secureCookie.Decode("session_id", cookie, &sessionID) == nil {
+			// Удаляем из персистентного хранилища (Redis/Memory)
+			h.sessionStorage.Delete(sessionID)
+			// Удаляем access_token из in-memory хранилища
+			h.tokenStorage.Delete(sessionID)
+		}
+	}
+	// Удаляем куки
+	c.SetCookie("session_id", "", -1, "/", "", true, true)
+	c.SetCookie("oauth_state", "", -1, "/", "", true, true)
+
+	c.JSON(200, gin.H{"message": "Logged out successfully"})
+}
+
+// CheckAuth проверяет статус аутентификации
+func (h *AuthHandler) CheckAuth(c *gin.Context) {
+	if cookie, err := c.Cookie("session_id"); err == nil {
+		var sessionID string
+		if h.secureCookie.Decode("session_id", cookie, &sessionID) == nil {
+			session, err := h.sessionStorage.Get(sessionID)
+			if err == nil && session != nil && !session.ExpiresAt.IsZero() {
+				c.JSON(200, gin.H{"authenticated": true, "user_id": session.UserID})
+				return
+			}
+		}
+	}
+	c.JSON(200, gin.H{"authenticated": false})
 }
 
 func generateRandomString(length int) string {
@@ -128,19 +192,4 @@ func generateRandomString(length int) string {
 func generateCodeChallenge(verifier string) string {
 	hash := sha256.Sum256([]byte(verifier))
 	return base64.URLEncoding.EncodeToString(hash[:])
-}
-
-func (h *AuthHandler) Logout(c *gin.Context) {
-	if cookie, err := c.Cookie("session_id"); err == nil {
-		var sessionID string
-		if h.secureCookie.Decode("session_id", cookie, &sessionID) == nil {
-			h.sessionStorage.DeleteSession(sessionID)
-		}
-	}
-
-	// Удаляем куки
-	c.SetCookie("session_id", "", -1, "/", "", true, true)
-	c.SetCookie("oauth_state", "", -1, "/", "", true, true)
-
-	c.JSON(200, gin.H{"message": "Logged out successfully"})
 }

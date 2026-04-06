@@ -1,6 +1,5 @@
 x-airflow-environment: &airflow-environment
   AIRFLOW__CORE__EXECUTOR: LocalExecutor
-  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
   AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
   AIRFLOW__CORE__FERNET_KEY: ''
   AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
@@ -45,7 +44,7 @@ services:
     environment:
       POSTGRES_DB: keycloak_db
       POSTGRES_USER: keycloak_user
-      POSTGRES_PASSWORD: keycloak_password
+      POSTGRES_PASSWORD: ${KC_DB_PASSWORD}
     volumes:
       - ./postgres-keycloak-data:/var/lib/postgresql/data
     ports:
@@ -54,29 +53,30 @@ services:
       - bionicpro-network
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U keycloak_user -d keycloak_db"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
+      interval: 10s
+      timeout: 5s
+      retries: 3
   
   keycloak:
-    image: quay.io/keycloak/keycloak:24.0.1
+    image: quay.io/keycloak/keycloak:25.0.4
     environment:
       KEYCLOAK_ADMIN: admin
-      KEYCLOAK_ADMIN_PASSWORD: admin
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
       KC_DB: postgres
       KC_DB_URL: jdbc:postgresql://keycloak_db:5432/keycloak_db
       KC_DB_USERNAME: keycloak_user
-      KC_DB_PASSWORD: keycloak_password
+      KC_DB_PASSWORD: ${KC_DB_PASSWORD}
       # Включаем HTTP
       KC_HTTP_ENABLED: "true"
       # ВАЖНО: Отключаем strict-режим полностью
       KC_HOSTNAME_STRICT: "false"
       KC_HOSTNAME_STRICT_HTTPS: "false"
+      KC_IMPORT: /opt/keycloak/data/import/realm-export.json
+      KC_IMPORT_STRATEGY: OVERWRITE_EXISTING
+      KC_HEALTH_ENABLED: "true"
       # Принудительно заставляем админку работать по HTTP
       # KC_HOSTNAME_ADMIN_URL: http://localhost:8082
-    command: >
-      start-dev
-      --import-realm
+    command: start
     volumes:
       - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json
     ports:
@@ -89,11 +89,59 @@ services:
     networks:
       - bionicpro-network
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health/ready"]
-      interval: 30s
-      timeout: 10s
+      test: ["CMD-SHELL", "timeout 5s bash -c ':> /dev/tcp/127.0.0.1/9000' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
       retries: 5
   
+  bionicpro-auth:
+    build: ./bionicpro-auth
+    ports:
+      - "3001:3000"
+    environment:
+      - SERVER_ADDRESS=:3000
+      - KEYCLOAK_URL=http://keycloak:8080
+      - REALM=reports-realm
+      - CLIENT_ID=bionicpro-auth-bff
+      - CLIENT_SECRET=keycloak_password
+      - SESSION_SECRET=d6f2a1b5-c3d4-4e5f-8a9b-0c1d2e3f4a5b
+      - REDIRECT_URL=http://localhost:3001/auth/callback
+      - SESSION_BACKEND=memory
+      - SESSION_REDIS_ADDR=redis:6379
+      - SESSION_REDIS_PASSWORD=""
+      - REFRESH_TOKEN_ENC_KEY=ZDZmMmExYjUtYzNkNC00ZTVmLThhOWItMGMxZDJlM2Y0YTVi
+      - MINIO_ENDPOINT=minio:9000
+      - MINIO_USER=minio_user
+      - MINIO_SECRET=minio_password
+      - MINIO_BUCKET=reports
+      - CLICKHOUSE_HOST=olap_db:9000
+      - CLICKHOUSE_DB=bionicpro
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=default_pwd
+      - ACCESS_TOKEN_TTL=120
+
+    depends_on:
+      keycloak:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      minio:
+        condition: service_started
+      olap_db:
+        condition: service_healthy
+
   frontend:
     build:
       context: ./frontend
@@ -101,10 +149,7 @@ services:
     ports:
       - "3000:3000"
     environment:
-      REACT_APP_API_URL: http://localhost:8000
-      REACT_APP_KEYCLOAK_URL: http://localhost:8082
-      REACT_APP_KEYCLOAK_REALM: reports-realm
-      REACT_APP_KEYCLOAK_CLIENT_ID: reports-frontend
+      REACT_APP_API_URL: http://localhost:3001
     networks:
       - bionicpro-network
   
@@ -140,7 +185,6 @@ services:
     volumes:
         - ./crm-db:/docker-entrypoint-initdb.d
         - ./postgres-crm-data:/var/lib/postgresql/data
-        - ./crm-db/init-replication.sql:/docker-entrypoint-initdb.d/10-replication.sql  # добавляем скрипт репликации
     ports:
       - "5444:5432"
     networks:
@@ -158,10 +202,10 @@ services:
       - "9431:9000"
     volumes:
       - ./clickhouse-data:/var/lib/clickhouse
-      - ./olap-db:/docker-entrypoint-initdb.d
       - ./olap-db:/var/lib/clickhouse/user_files
       - ./olap-db/users.xml:/etc/clickhouse-server/users.d/users.xml
-      - ./clickhouse/init-cdc.sql:/docker-entrypoint-initdb.d/10-cdc-init.sql  # Добавляем CDC инициализацию
+      - ./olap-db/init.sql:/docker-entrypoint-initdb.d/01-init.sql
+      - ./olap-db/init-cdc.sql:/docker-entrypoint-initdb.d/10-cdc-init.sql
     healthcheck:
       test: ["CMD-SHELL", "clickhouse-client --user default --password default_pwd --query 'SELECT 1' || exit 1"]
       interval: 5s
@@ -350,6 +394,14 @@ services:
       STATUS_STORAGE_TOPIC: crm-connect-statuses
       CONNECT_CONFIG_PROVIDERS: "file"
       CONNECT_CONFIG_PROVIDERS_FILE_PATH: "/kafka/connect"
+      # Хочу ключ как JSON
+      CONNECT_KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      # Хочу тело как JSON
+      CONNECT_VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      # Не хочу лишнюю обложку для ключа
+      CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      # Не хочу лишнюю обложку для тела
+      CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
     ports:
       - "8083:8083"
     volumes:

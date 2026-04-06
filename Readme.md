@@ -82,7 +82,7 @@ docker exec -it architecture-bionicpro-keycloak_db-1 psql -U keycloak_user -d ke
 [Полный поток данных](./_docs/cdc.puml)
 
 ### Магия Debezium в PostgreSQL
-- Включение логической репиликации [скриптом](./crm-db/init-replication.sql)
+- Включение логической репиликации [скриптом](./crm-db/configure-replication.sql)
 - - пользователь БД (crm_user) должен иметь права REPLICATION:
 ```sql
 ALTER USER crm_user WITH REPLICATION;
@@ -100,6 +100,7 @@ curl -s http://localhost:8083/connectors/crm-postgres-connector/status | jq .
 ```
 
 ### Магия KafkaEngine в ClickHouse
+[Диагарамма потока данных](./_docs/dfd.puml)
 - Таблица-интерфейс для Kafka (виртуальная) kafka_customers, магия в ENGINE = Kafka, где:
 - - 'kafka:9092' - брокер
 - - 'crm-db-server.public.customers' - топик
@@ -114,3 +115,7 @@ curl -s http://localhost:8083/connectors/crm-postgres-connector/status | jq .
 - - слушает таблицу kafka_customers.
 - - как только в нее поступает новая строка (сообщение из Kafka), запускается запрос SELECT ... FROM kafka_customers.
 - - результат этого запроса автоматически вставляется в целевую таблицу - customers_cdc.
+- Materialized View — customer_reporting_mv - подписан на предыдущую MV - customers_cdc_mv:
+- - слушает изменения в customers_cdc_mv.
+- - как только в нее поступает новая строка (*реакция* на сообщение из Kafka), запускается запрос SELECT ... FROM customers_cdc_mv.
+- - результат этого запроса автоматически вставляется в целевую таблицу - customer_reporting_mart.

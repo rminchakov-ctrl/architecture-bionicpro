@@ -1,3 +1,7 @@
+CREATE DATABASE IF NOT EXISTS bionicpro;
+
+USE bionicpro;
+
 CREATE TABLE IF NOT EXISTS emg_sensor_data (
     user_id UInt32,
     prosthesis_type String,

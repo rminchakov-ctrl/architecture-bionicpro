@@ -9,7 +9,7 @@ type EMGData struct {
 	MuscleGroup     string    `json:"muscle_group"`
 	SignalFrequency uint32    `json:"signal_frequency"`
 	SignalDuration  uint32    `json:"signal_duration"`
-	SignalAmplitude float64   `json:"signal_amplitude"` // Исправляем на float64 для JSON
+	SignalAmplitude float64   `json:"signal_amplitude"`
 	SignalTime      time.Time `json:"signal_time"`
 }
 
